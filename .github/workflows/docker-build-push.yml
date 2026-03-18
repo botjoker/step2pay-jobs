@@ -1,0 +1,44 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2. Войти в Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 3. Кэш слоёв Docker
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      # 4. Сборка Docker-образа
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/sambacrm-jobs:${{ github.sha }} .
+          docker tag ${{ secrets.DOCKER_USERNAME }}/sambacrm-jobs:${{ github.sha }} ${{ secrets.DOCKER_USERNAME }}/sambacrm-jobs:latest
+
+      # 5. Публикация Docker-образа
+      - name: Push Docker image
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/sambacrm-jobs:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/sambacrm-jobs:latest
