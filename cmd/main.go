@@ -21,6 +21,6 @@ func main() {
 	defer pool.Close()
 
 	log.Printf("Scheduler started. Poll interval: %s", cfg.PollInterval)
-	s := scheduler.New(pool, cfg.PollInterval)
+	s := scheduler.New(pool, cfg)
 	s.Run(ctx)
 }

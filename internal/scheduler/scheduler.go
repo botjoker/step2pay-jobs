@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sambacrm/scheduler/internal/action"
+	"github.com/sambacrm/scheduler/internal/config"
 	"github.com/sambacrm/scheduler/internal/models"
 	"github.com/sambacrm/scheduler/internal/repository"
 	"github.com/sambacrm/scheduler/internal/trigger"
@@ -17,13 +18,15 @@ type Scheduler struct {
 	repo         *repository.JobRepo
 	pool         *pgxpool.Pool
 	pollInterval time.Duration
+	actions      map[string]action.Action
 }
 
-func New(pool *pgxpool.Pool, pollInterval time.Duration) *Scheduler {
+func New(pool *pgxpool.Pool, cfg *config.Config) *Scheduler {
 	return &Scheduler{
 		repo:         repository.NewJobRepo(pool),
 		pool:         pool,
-		pollInterval: pollInterval,
+		pollInterval: cfg.PollInterval,
+		actions:      action.BuildRegistry(cfg),
 	}
 }
 
@@ -75,7 +78,7 @@ func (s *Scheduler) processJob(ctx context.Context, job models.SchedulerJob) {
 		return
 	}
 
-	act, ok := action.Registry[job.ActionType]
+	act, ok := s.actions[job.ActionType]
 	if !ok {
 		s.finish(ctx, job, "error", fmt.Sprintf("unknown action: %s", job.ActionType), 0)
 		return

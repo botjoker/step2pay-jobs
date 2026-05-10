@@ -1,9 +1,11 @@
 package action
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -21,7 +23,7 @@ import (
 //
 //	{
 //	  "channel": "telegram",       // "telegram" | "vk" | "both"
-//	  "recipient_type": "client",  // "client" | "group"
+//	  "recipient_type": "client",  // "client" | "group" | "debtors" | etc.
 //	  "recipient_id": "uuid",      // client_id или group_id
 //	  "message": "Привет, {{name}}! Занятие завтра в 18:00."
 //	}
@@ -31,11 +33,15 @@ import (
 //	{{name}}      → имя клиента (firstname + lastname)
 //	{{firstname}} → только имя
 //	{{lastname}}  → только фамилия
-type NotificationAction struct{}
+//	+ любые ключи из recipient.TemplateVars
+type NotificationAction struct {
+	rustBaseURL string
+	internalKey string
+}
 
 type notificationConfig struct {
 	Channel       string `json:"channel"`        // "telegram" | "vk" | "both"
-	RecipientType string `json:"recipient_type"` // "client" | "group"
+	RecipientType string `json:"recipient_type"` // "client" | "group" | ...
 	RecipientID   string `json:"recipient_id"`
 	Message       string `json:"message"`
 }
@@ -47,11 +53,19 @@ type notificationSettings struct {
 	VKCommunityToken string
 }
 
-type clientContact struct {
-	Firstname      string
-	Lastname       string
-	TelegramChatID *string
-	VKUserID       *string
+type audienceRequest struct {
+	ProfileID    string          `json:"profile_id"`
+	AudienceType string          `json:"audience_type"`
+	Params       json.RawMessage `json:"params"`
+}
+
+type recipientInfo struct {
+	ClientID       string            `json:"client_id"`
+	Firstname      string            `json:"firstname"`
+	Lastname       string            `json:"lastname"`
+	TelegramChatID *string           `json:"telegram_chat_id"`
+	VkUserID       *string           `json:"vk_user_id"`
+	TemplateVars   map[string]string `json:"template_vars"`
 }
 
 func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJob, pool *pgxpool.Pool) (int, error) {
@@ -59,14 +73,14 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	if err := json.Unmarshal(job.ActionConfig, &cfg); err != nil {
 		return 0, fmt.Errorf("invalid action_config: %w", err)
 	}
-	if cfg.RecipientID == "" {
-		return 0, fmt.Errorf("recipient_id is required")
-	}
 	if cfg.Message == "" {
 		return 0, fmt.Errorf("message is required")
 	}
 	if cfg.Channel == "" {
 		cfg.Channel = "telegram"
+	}
+	if cfg.RecipientType == "" {
+		cfg.RecipientType = "client"
 	}
 
 	settings, err := loadNotificationSettings(ctx, pool, job.ProfileID.String())
@@ -81,61 +95,51 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return 0, fmt.Errorf("vk notifications disabled for this profile")
 	}
 
-	var contacts []clientContact
-	switch cfg.RecipientType {
-	case "client":
-		c, err := loadClient(ctx, pool, cfg.RecipientID, job.ProfileID.String())
-		if err != nil {
-			return 0, fmt.Errorf("load client: %w", err)
-		}
-		contacts = []clientContact{c}
-	case "group":
-		contacts, err = loadGroupMembers(ctx, pool, cfg.RecipientID, job.ProfileID.String())
-		if err != nil {
-			return 0, fmt.Errorf("load group members: %w", err)
-		}
-	default:
-		return 0, fmt.Errorf("unknown recipient_type: %s (use 'client' or 'group')", cfg.RecipientType)
+	// Pass the full action_config as params so Rust can read all fields
+	// (recipient_id, group_id, min_debt, sessions_threshold, etc.)
+	recipients, err := a.fetchAudience(ctx, job.ProfileID.String(), cfg.RecipientType, job.ActionConfig)
+	if err != nil {
+		return 0, fmt.Errorf("fetch audience: %w", err)
 	}
 
-	if len(contacts) == 0 {
+	if len(recipients) == 0 {
 		return 0, nil
 	}
 
 	sent := 0
 	var errs []string
-	for _, contact := range contacts {
-		text := renderMessage(cfg.Message, contact)
+	for _, r := range recipients {
+		text := renderMessage(cfg.Message, r)
 		switch cfg.Channel {
 		case "telegram":
-			if contact.TelegramChatID == nil {
+			if r.TelegramChatID == nil {
 				continue
 			}
-			if err := sendTelegram(settings.TelegramBotToken, *contact.TelegramChatID, text); err != nil {
-				errs = append(errs, fmt.Sprintf("tg(%s): %v", *contact.TelegramChatID, err))
+			if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
+				errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 				continue
 			}
 			sent++
 		case "vk":
-			if contact.VKUserID == nil {
+			if r.VkUserID == nil {
 				continue
 			}
-			if err := sendVK(settings.VKCommunityToken, *contact.VKUserID, text); err != nil {
-				errs = append(errs, fmt.Sprintf("vk(%s): %v", *contact.VKUserID, err))
+			if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
+				errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
 				continue
 			}
 			sent++
 		case "both":
-			if contact.TelegramChatID != nil {
-				if err := sendTelegram(settings.TelegramBotToken, *contact.TelegramChatID, text); err != nil {
-					errs = append(errs, fmt.Sprintf("tg(%s): %v", *contact.TelegramChatID, err))
+			if r.TelegramChatID != nil {
+				if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
+					errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 				} else {
 					sent++
 				}
 			}
-			if contact.VKUserID != nil {
-				if err := sendVK(settings.VKCommunityToken, *contact.VKUserID, text); err != nil {
-					errs = append(errs, fmt.Sprintf("vk(%s): %v", *contact.VKUserID, err))
+			if r.VkUserID != nil {
+				if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
+					errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
 				} else {
 					sent++
 				}
@@ -147,6 +151,50 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return sent, fmt.Errorf("partial failures (%d sent): %s", sent, strings.Join(errs, "; "))
 	}
 	return sent, nil
+}
+
+func (a *NotificationAction) fetchAudience(
+	ctx context.Context,
+	profileID string,
+	audienceType string,
+	params json.RawMessage,
+) ([]recipientInfo, error) {
+	reqBody := audienceRequest{
+		ProfileID:    profileID,
+		AudienceType: audienceType,
+		Params:       params,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAudience marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		a.rustBaseURL+"/internal/scheduler/audience",
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAudience new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Key", a.internalKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAudience do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("fetchAudience status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var recipients []recipientInfo
+	if err := json.NewDecoder(resp.Body).Decode(&recipients); err != nil {
+		return nil, fmt.Errorf("fetchAudience decode: %w", err)
+	}
+	return recipients, nil
 }
 
 func loadNotificationSettings(ctx context.Context, pool *pgxpool.Pool, profileID string) (notificationSettings, error) {
@@ -166,46 +214,14 @@ func loadNotificationSettings(ctx context.Context, pool *pgxpool.Pool, profileID
 	return s, nil
 }
 
-func loadClient(ctx context.Context, pool *pgxpool.Pool, clientID, profileID string) (clientContact, error) {
-	var c clientContact
-	err := pool.QueryRow(ctx, `
-		SELECT firstname, lastname, telegram_chat_id, vk_user_id
-		FROM clients
-		WHERE id = $1 AND profile_id = $2 AND archived = false
-	`, clientID, profileID).Scan(&c.Firstname, &c.Lastname, &c.TelegramChatID, &c.VKUserID)
-	return c, err
-}
-
-func loadGroupMembers(ctx context.Context, pool *pgxpool.Pool, groupID, profileID string) ([]clientContact, error) {
-	rows, err := pool.Query(ctx, `
-		SELECT c.firstname, c.lastname, c.telegram_chat_id, c.vk_user_id
-		FROM client_group_links l
-		JOIN clients c ON c.id = l.client_id
-		WHERE l.group_id = $1
-		  AND l.profile_id = $2
-		  AND l.archived = false
-		  AND c.archived = false
-	`, groupID, profileID)
-	if err != nil {
-		return nil, err
+func renderMessage(tmpl string, r recipientInfo) string {
+	fullName := strings.TrimSpace(r.Firstname + " " + r.Lastname)
+	s := strings.ReplaceAll(tmpl, "{{name}}", fullName)
+	s = strings.ReplaceAll(s, "{{firstname}}", r.Firstname)
+	s = strings.ReplaceAll(s, "{{lastname}}", r.Lastname)
+	for k, v := range r.TemplateVars {
+		s = strings.ReplaceAll(s, "{{"+k+"}}", v)
 	}
-	defer rows.Close()
-
-	var result []clientContact
-	for rows.Next() {
-		var c clientContact
-		if err := rows.Scan(&c.Firstname, &c.Lastname, &c.TelegramChatID, &c.VKUserID); err != nil {
-			return nil, err
-		}
-		result = append(result, c)
-	}
-	return result, rows.Err()
-}
-
-func renderMessage(tmpl string, c clientContact) string {
-	s := strings.ReplaceAll(tmpl, "{{name}}", strings.TrimSpace(c.Firstname+" "+c.Lastname))
-	s = strings.ReplaceAll(s, "{{firstname}}", c.Firstname)
-	s = strings.ReplaceAll(s, "{{lastname}}", c.Lastname)
 	return s
 }
 

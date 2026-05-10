@@ -10,8 +10,10 @@ import (
 )
 
 type Config struct {
-	DatabaseURL  string
-	PollInterval time.Duration
+	DatabaseURL     string
+	PollInterval    time.Duration
+	RustAPIBaseURL  string
+	InternalAPIKey  string
 }
 
 func Load() *Config {
@@ -27,8 +29,15 @@ func Load() *Config {
 		pollSecs = 900
 	}
 
+	rustBaseURL := os.Getenv("RUST_API_BASE_URL")
+	if rustBaseURL == "" {
+		rustBaseURL = "http://localhost:8080"
+	}
+
 	return &Config{
-		DatabaseURL:  dbURL,
-		PollInterval: time.Duration(pollSecs) * time.Second,
+		DatabaseURL:    dbURL,
+		PollInterval:   time.Duration(pollSecs) * time.Second,
+		RustAPIBaseURL: rustBaseURL,
+		InternalAPIKey: os.Getenv("INTERNAL_API_KEY"),
 	}
 }
