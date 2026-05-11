@@ -63,6 +63,20 @@ func (s *Scheduler) tick(ctx context.Context) {
 func (s *Scheduler) processJob(ctx context.Context, job models.SchedulerJob) {
 	log.Printf("[scheduler] job %s (%s) start", job.ID, job.Name)
 
+	// Новый cron-job без next_run: только вычислить время, не запускать.
+	if job.NextRun == nil && job.TriggerType == "cron" {
+		nextRun, err := trigger.NextRunForJob(job, s.pollInterval)
+		if err != nil {
+			log.Printf("[scheduler] warn: cannot compute next_run for job %s: %v", job.ID, err)
+			return
+		}
+		if err := s.repo.UpdateNextRun(ctx, job.ID, nextRun); err != nil {
+			log.Printf("[scheduler] warn: UpdateNextRun job %s: %v", job.ID, err)
+		}
+		log.Printf("[scheduler] job %s: initialized next_run=%v", job.ID, nextRun)
+		return
+	}
+
 	trig, ok := trigger.Registry[job.TriggerType]
 	if !ok {
 		s.finish(ctx, job, "error", fmt.Sprintf("unknown trigger: %s", job.TriggerType), 0)

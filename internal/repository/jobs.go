@@ -56,6 +56,13 @@ func (r *JobRepo) UpdateAfterRun(ctx context.Context, jobID uuid.UUID, nextRun *
 	return err
 }
 
+func (r *JobRepo) UpdateNextRun(ctx context.Context, jobID uuid.UUID, nextRun *time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE scheduler_jobs SET next_run = $1, updated_at = now() WHERE id = $2
+	`, nextRun, jobID)
+	return err
+}
+
 func (r *JobRepo) WriteLog(ctx context.Context, jobID uuid.UUID, status, message string, count int) error {
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO scheduler_job_logs (job_id, status, message, affected_count)
