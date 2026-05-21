@@ -112,6 +112,21 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return 0, "", nil
 	}
 
+	// Init Telegram bot once — avoids a getMe call per recipient.
+	var tgBot *tgbotapi.BotAPI
+	needTG := (cfg.Channel == "telegram" || cfg.Channel == "both") && settings.TelegramEnabled
+	if needTG {
+		var botErr error
+		tgBot, botErr = tgbotapi.NewBotAPI(settings.TelegramBotToken)
+		if botErr != nil {
+			if cfg.Channel == "telegram" {
+				return 0, "", fmt.Errorf("init telegram bot: %w", botErr)
+			}
+			// for "both": log warning, proceed with VK only
+			tgBot = nil
+		}
+	}
+
 	sent := 0
 	var errs []string
 	noTGID, noVKID := 0, 0
@@ -124,7 +139,7 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 				noTGID++
 				continue
 			}
-			if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
+			if err := sendTelegramMsg(tgBot, *r.TelegramChatID, text); err != nil {
 				errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 				continue
 			}
@@ -140,9 +155,9 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 			}
 			sent++
 		case "both":
-			if settings.TelegramEnabled {
+			if tgBot != nil {
 				if r.TelegramChatID != nil {
-					if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
+					if err := sendTelegramMsg(tgBot, *r.TelegramChatID, text); err != nil {
 						errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 					} else {
 						sent++
@@ -277,17 +292,13 @@ func renderMessage(tmpl string, r recipientInfo) string {
 	return s
 }
 
-func sendTelegram(botToken, chatID, message string) error {
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		return fmt.Errorf("init bot: %w", err)
-	}
+func sendTelegramMsg(bot *tgbotapi.BotAPI, chatID, message string) error {
 	var chatIDInt int64
 	if _, err := fmt.Sscanf(chatID, "%d", &chatIDInt); err != nil {
 		return fmt.Errorf("invalid chat_id %q: %w", chatID, err)
 	}
 	msg := tgbotapi.NewMessage(chatIDInt, message)
-	_, err = bot.Send(msg)
+	_, err := bot.Send(msg)
 	return err
 }
 
