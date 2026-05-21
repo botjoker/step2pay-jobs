@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -113,16 +114,18 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	}
 
 	// Init Telegram bot once — avoids a getMe call per recipient.
+	// Use a 10s timeout so a network blip fails fast instead of hanging per-recipient.
 	var tgBot *tgbotapi.BotAPI
 	needTG := (cfg.Channel == "telegram" || cfg.Channel == "both") && settings.TelegramEnabled
 	if needTG {
+		tgHTTPClient := &http.Client{Timeout: 10 * time.Second}
 		var botErr error
-		tgBot, botErr = tgbotapi.NewBotAPI(settings.TelegramBotToken)
+		tgBot, botErr = tgbotapi.NewBotAPIWithClient(settings.TelegramBotToken, tgbotapi.APIEndpoint, tgHTTPClient)
 		if botErr != nil {
 			if cfg.Channel == "telegram" {
 				return 0, "", fmt.Errorf("init telegram bot: %w", botErr)
 			}
-			// for "both": log warning, proceed with VK only
+			// for "both": proceed with VK only
 			tgBot = nil
 		}
 	}
