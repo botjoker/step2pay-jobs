@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -68,13 +69,13 @@ type recipientInfo struct {
 	TemplateVars   map[string]string `json:"template_vars"`
 }
 
-func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJob, pool *pgxpool.Pool) (int, error) {
+func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJob, pool *pgxpool.Pool) (int, string, error) {
 	var cfg notificationConfig
 	if err := json.Unmarshal(job.ActionConfig, &cfg); err != nil {
-		return 0, fmt.Errorf("invalid action_config: %w", err)
+		return 0, "", fmt.Errorf("invalid action_config: %w", err)
 	}
 	if cfg.Message == "" {
-		return 0, fmt.Errorf("message is required")
+		return 0, "", fmt.Errorf("message is required")
 	}
 	if cfg.Channel == "" {
 		cfg.Channel = "telegram"
@@ -85,27 +86,27 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 
 	settings, err := loadNotificationSettings(ctx, pool, job.ProfileID.String())
 	if err != nil {
-		return 0, fmt.Errorf("load notification settings: %w", err)
+		return 0, "", fmt.Errorf("load notification settings: %w", err)
 	}
 
 	if cfg.Channel == "telegram" && !settings.TelegramEnabled {
-		return 0, fmt.Errorf("telegram notifications disabled for this profile")
+		return 0, "", fmt.Errorf("telegram notifications disabled for this profile")
 	}
 	if cfg.Channel == "vk" && !settings.VKEnabled {
-		return 0, fmt.Errorf("vk notifications disabled for this profile")
+		return 0, "", fmt.Errorf("vk notifications disabled for this profile")
 	}
 
 	params, err := buildAudienceParams(cfg, job.ActionConfig)
 	if err != nil {
-		return 0, fmt.Errorf("build audience params: %w", err)
+		return 0, "", fmt.Errorf("build audience params: %w", err)
 	}
 	recipients, err := a.fetchAudience(ctx, job.ProfileID.String(), cfg.RecipientType, params)
 	if err != nil {
-		return 0, fmt.Errorf("fetch audience: %w", err)
+		return 0, "", fmt.Errorf("fetch audience: %w", err)
 	}
 
 	if len(recipients) == 0 {
-		return 0, nil
+		return 0, "", nil
 	}
 
 	sent := 0
@@ -149,10 +150,14 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		}
 	}
 
-	if len(errs) > 0 {
-		return sent, fmt.Errorf("partial failures (%d sent): %s", sent, strings.Join(errs, "; "))
+	if len(errs) > 0 && sent == 0 {
+		return 0, "", fmt.Errorf("all failed: %s", strings.Join(errs, "; "))
 	}
-	return sent, nil
+	if len(errs) > 0 {
+		warn := fmt.Sprintf("sent %d, not delivered to %d: %s", sent, len(errs), strings.Join(errs, "; "))
+		return sent, warn, nil
+	}
+	return sent, "", nil
 }
 
 // buildAudienceParams converts action_config into params expected by the backend audience endpoint.
@@ -231,6 +236,8 @@ func loadNotificationSettings(ctx context.Context, pool *pgxpool.Pool, profileID
 	return s, nil
 }
 
+var unresolvedPlaceholder = regexp.MustCompile(`\{\{[^}]+\}\}`)
+
 func renderMessage(tmpl string, r recipientInfo) string {
 	fullName := strings.TrimSpace(r.Firstname + " " + r.Lastname)
 	s := strings.ReplaceAll(tmpl, "{{name}}", fullName)
@@ -239,6 +246,7 @@ func renderMessage(tmpl string, r recipientInfo) string {
 	for k, v := range r.TemplateVars {
 		s = strings.ReplaceAll(s, "{{"+k+"}}", v)
 	}
+	s = unresolvedPlaceholder.ReplaceAllString(s, "")
 	return s
 }
 

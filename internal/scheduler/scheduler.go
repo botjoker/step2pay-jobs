@@ -97,12 +97,16 @@ func (s *Scheduler) processJob(ctx context.Context, job models.SchedulerJob) {
 		s.finish(ctx, job, "error", fmt.Sprintf("unknown action: %s", job.ActionType), 0)
 		return
 	}
-	count, err := act.Execute(ctx, job, s.pool)
+	count, warn, err := act.Execute(ctx, job, s.pool)
 	if err != nil {
 		s.finish(ctx, job, "error", fmt.Sprintf("action error: %v", err), 0)
 		return
 	}
-	s.finish(ctx, job, "success", fmt.Sprintf("affected %d records", count), count)
+	msg := fmt.Sprintf("affected %d records", count)
+	if warn != "" {
+		msg = warn
+	}
+	s.finish(ctx, job, "success", msg, count)
 }
 
 func (s *Scheduler) finish(ctx context.Context, job models.SchedulerJob, status, message string, count int) {
