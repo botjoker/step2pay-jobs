@@ -95,6 +95,9 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	if cfg.Channel == "vk" && !settings.VKEnabled {
 		return 0, "", fmt.Errorf("vk notifications disabled for this profile")
 	}
+	if cfg.Channel == "both" && !settings.TelegramEnabled && !settings.VKEnabled {
+		return 0, "", fmt.Errorf("both channels disabled for this profile")
+	}
 
 	params, err := buildAudienceParams(cfg, job.ActionConfig)
 	if err != nil {
@@ -111,11 +114,14 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 
 	sent := 0
 	var errs []string
+	noTGID, noVKID := 0, 0
+
 	for _, r := range recipients {
 		text := renderMessage(cfg.Message, r)
 		switch cfg.Channel {
 		case "telegram":
 			if r.TelegramChatID == nil {
+				noTGID++
 				continue
 			}
 			if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
@@ -125,6 +131,7 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 			sent++
 		case "vk":
 			if r.VkUserID == nil {
+				noVKID++
 				continue
 			}
 			if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
@@ -133,29 +140,49 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 			}
 			sent++
 		case "both":
-			if r.TelegramChatID != nil {
-				if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
-					errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
+			if settings.TelegramEnabled {
+				if r.TelegramChatID != nil {
+					if err := sendTelegram(settings.TelegramBotToken, *r.TelegramChatID, text); err != nil {
+						errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
+					} else {
+						sent++
+					}
 				} else {
-					sent++
+					noTGID++
 				}
 			}
-			if r.VkUserID != nil {
-				if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
-					errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
+			if settings.VKEnabled {
+				if r.VkUserID != nil {
+					if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
+						errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
+					} else {
+						sent++
+					}
 				} else {
-					sent++
+					noVKID++
 				}
 			}
 		}
 	}
 
-	if len(errs) > 0 && sent == 0 {
-		return 0, "", fmt.Errorf("all failed: %s", strings.Join(errs, "; "))
+	var parts []string
+	parts = append(parts, fmt.Sprintf("sent %d", sent))
+	if noTGID > 0 {
+		parts = append(parts, fmt.Sprintf("no telegram id: %d", noTGID))
+	}
+	if noVKID > 0 {
+		parts = append(parts, fmt.Sprintf("no vk id: %d", noVKID))
 	}
 	if len(errs) > 0 {
-		warn := fmt.Sprintf("sent %d, not delivered to %d: %s", sent, len(errs), strings.Join(errs, "; "))
-		return sent, warn, nil
+		parts = append(parts, fmt.Sprintf("failed: %s", strings.Join(errs, "; ")))
+	}
+	msg := strings.Join(parts, " | ")
+
+	if sent == 0 && len(errs) > 0 {
+		return 0, "", fmt.Errorf("all failed: %s", strings.Join(errs, "; "))
+	}
+	if len(errs) > 0 || noTGID > 0 || noVKID > 0 {
+		return sent, msg, nil
 	}
 	return sent, "", nil
 }
