@@ -95,9 +95,11 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return 0, fmt.Errorf("vk notifications disabled for this profile")
 	}
 
-	// Pass the full action_config as params so Rust can read all fields
-	// (recipient_id, group_id, min_debt, sessions_threshold, etc.)
-	recipients, err := a.fetchAudience(ctx, job.ProfileID.String(), cfg.RecipientType, job.ActionConfig)
+	params, err := buildAudienceParams(cfg, job.ActionConfig)
+	if err != nil {
+		return 0, fmt.Errorf("build audience params: %w", err)
+	}
+	recipients, err := a.fetchAudience(ctx, job.ProfileID.String(), cfg.RecipientType, params)
 	if err != nil {
 		return 0, fmt.Errorf("fetch audience: %w", err)
 	}
@@ -151,6 +153,21 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return sent, fmt.Errorf("partial failures (%d sent): %s", sent, strings.Join(errs, "; "))
 	}
 	return sent, nil
+}
+
+// buildAudienceParams converts action_config into params expected by the backend audience endpoint.
+// For client/group the backend expects client_id/group_id; for other types pass config as-is.
+func buildAudienceParams(cfg notificationConfig, rawConfig json.RawMessage) (json.RawMessage, error) {
+	switch cfg.RecipientType {
+	case "client":
+		p, err := json.Marshal(map[string]string{"client_id": cfg.RecipientID})
+		return p, err
+	case "group":
+		p, err := json.Marshal(map[string]string{"group_id": cfg.RecipientID})
+		return p, err
+	default:
+		return rawConfig, nil
+	}
 }
 
 func (a *NotificationAction) fetchAudience(
