@@ -31,6 +31,8 @@ func NextCronRun(triggerConfig json.RawMessage) (*time.Time, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid cron expression %q: %w", cfg.Cron, err)
 	}
-	next := schedule.Next(time.Now())
+	// Cron expressions are always interpreted in Moscow time (UTC+3, no DST since 2014).
+	msk := time.FixedZone("MSK", 3*60*60)
+	next := schedule.Next(time.Now().In(msk))
 	return &next, nil
 }
