@@ -20,5 +20,9 @@ func BuildRegistry(cfg *config.Config) map[string]Action {
 			rustBaseURL: cfg.RustAPIBaseURL,
 			internalKey: cfg.InternalAPIKey,
 		},
+		"retry_notifications": &RetryNotificationsAction{
+			rustBaseURL: cfg.RustAPIBaseURL,
+			internalKey: cfg.InternalAPIKey,
+		},
 	}
 }

@@ -11,12 +11,42 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sambacrm/scheduler/internal/models"
 )
+
+type profileRateLimiter struct {
+	mu       sync.Mutex
+	lastCall time.Time
+	interval time.Duration
+}
+
+func (r *profileRateLimiter) Wait() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if elapsed := now.Sub(r.lastCall); elapsed < r.interval {
+		time.Sleep(r.interval - elapsed)
+	}
+	r.lastCall = time.Now()
+}
+
+var tgLimiters sync.Map // profileID -> *profileRateLimiter
+var vkLimiters sync.Map // profileID -> *profileRateLimiter
+
+func getTGLimiter(profileID string) *profileRateLimiter {
+	v, _ := tgLimiters.LoadOrStore(profileID, &profileRateLimiter{interval: 40 * time.Millisecond})
+	return v.(*profileRateLimiter)
+}
+
+func getVKLimiter(profileID string) *profileRateLimiter {
+	v, _ := vkLimiters.LoadOrStore(profileID, &profileRateLimiter{interval: 55 * time.Millisecond})
+	return v.(*profileRateLimiter)
+}
 
 // NotificationAction отправляет сообщение клиенту или всей группе
 // через Telegram, VK, или оба канала.
@@ -68,6 +98,7 @@ type recipientInfo struct {
 	TelegramChatID *string           `json:"telegram_chat_id"`
 	VkUserID       *string           `json:"vk_user_id"`
 	TemplateVars   map[string]string `json:"template_vars"`
+	SubscriptionID *string           `json:"subscription_id,omitempty"`
 }
 
 func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJob, pool *pgxpool.Pool) (int, string, error) {
@@ -133,37 +164,45 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	sent := 0
 	var errs []string
 	noTGID, noVKID := 0, 0
+	var sentSubscriptionIDs []string
 
 	for _, r := range recipients {
 		text := renderMessage(cfg.Message, r)
+		var anySent bool
 		switch cfg.Channel {
 		case "telegram":
 			if r.TelegramChatID == nil {
 				noTGID++
 				continue
 			}
+			getTGLimiter(job.ProfileID.String()).Wait()
 			if err := sendTelegramMsg(tgBot, *r.TelegramChatID, text); err != nil {
 				errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 				continue
 			}
 			sent++
+			anySent = true
 		case "vk":
 			if r.VkUserID == nil {
 				noVKID++
 				continue
 			}
+			getVKLimiter(job.ProfileID.String()).Wait()
 			if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
 				errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
 				continue
 			}
 			sent++
+			anySent = true
 		case "both":
 			if tgBot != nil {
 				if r.TelegramChatID != nil {
+					getTGLimiter(job.ProfileID.String()).Wait()
 					if err := sendTelegramMsg(tgBot, *r.TelegramChatID, text); err != nil {
 						errs = append(errs, fmt.Sprintf("tg(%s): %v", *r.TelegramChatID, err))
 					} else {
 						sent++
+						anySent = true
 					}
 				} else {
 					noTGID++
@@ -171,15 +210,28 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 			}
 			if settings.VKEnabled {
 				if r.VkUserID != nil {
+					getVKLimiter(job.ProfileID.String()).Wait()
 					if err := sendVK(settings.VKCommunityToken, *r.VkUserID, text); err != nil {
 						errs = append(errs, fmt.Sprintf("vk(%s): %v", *r.VkUserID, err))
 					} else {
 						sent++
+						anySent = true
 					}
 				} else {
 					noVKID++
 				}
 			}
+		}
+		if anySent && cfg.RecipientType == "low_subscription" && r.SubscriptionID != nil {
+			sentSubscriptionIDs = append(sentSubscriptionIDs, *r.SubscriptionID)
+		}
+	}
+
+	// Двухфазный коммит: подтверждаем доставку для low_subscription (#1)
+	if len(sentSubscriptionIDs) > 0 {
+		if err := a.confirmDelivery(ctx, "low_subscription", sentSubscriptionIDs); err != nil {
+			// Не фатально: lease сам истечёт через 15 мин, просто лог
+			errs = append(errs, fmt.Sprintf("confirm delivery: %v", err))
 		}
 	}
 
@@ -203,6 +255,42 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 		return sent, msg, nil
 	}
 	return sent, "", nil
+}
+
+type confirmDeliveryRequest struct {
+	RecipientType   string   `json:"recipient_type"`
+	SubscriptionIDs []string `json:"subscription_ids"`
+}
+
+func (a *NotificationAction) confirmDelivery(ctx context.Context, recipientType string, subscriptionIDs []string) error {
+	body := confirmDeliveryRequest{
+		RecipientType:   recipientType,
+		SubscriptionIDs: subscriptionIDs,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		a.rustBaseURL+"/internal/scheduler/audience/confirm",
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Key", a.internalKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
 }
 
 // buildAudienceParams converts action_config into params expected by the backend audience endpoint.
