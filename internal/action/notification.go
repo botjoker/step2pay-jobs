@@ -165,6 +165,7 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	var errs []string
 	noTGID, noVKID := 0, 0
 	var sentSubscriptionIDs []string
+	var sentClientIDs []string
 
 	for _, r := range recipients {
 		text := renderMessage(cfg.Message, r)
@@ -222,14 +223,17 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 				}
 			}
 		}
-		if anySent && cfg.RecipientType == "low_subscription" && r.SubscriptionID != nil {
+		if anySent && (cfg.RecipientType == "low_subscription" || cfg.RecipientType == "expiring_soon") && r.SubscriptionID != nil {
 			sentSubscriptionIDs = append(sentSubscriptionIDs, *r.SubscriptionID)
+		}
+		if anySent && r.ClientID != "" {
+			sentClientIDs = append(sentClientIDs, r.ClientID)
 		}
 	}
 
-	// Двухфазный коммит: подтверждаем доставку для low_subscription (#1)
-	if len(sentSubscriptionIDs) > 0 {
-		if err := a.confirmDelivery(ctx, "low_subscription", sentSubscriptionIDs); err != nil {
+	// Двухфазный коммит: подтверждаем доставку (legacy subscription-поля + унифицированный дедуп).
+	if len(sentSubscriptionIDs) > 0 || len(sentClientIDs) > 0 {
+		if err := a.confirmDelivery(ctx, cfg.RecipientType, job.ProfileID.String(), sentSubscriptionIDs, sentClientIDs); err != nil {
 			// Не фатально: lease сам истечёт через 15 мин, просто лог
 			errs = append(errs, fmt.Sprintf("confirm delivery: %v", err))
 		}
@@ -259,13 +263,17 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 
 type confirmDeliveryRequest struct {
 	RecipientType   string   `json:"recipient_type"`
+	ProfileID       string   `json:"profile_id"`
 	SubscriptionIDs []string `json:"subscription_ids"`
+	ClientIDs       []string `json:"client_ids"`
 }
 
-func (a *NotificationAction) confirmDelivery(ctx context.Context, recipientType string, subscriptionIDs []string) error {
+func (a *NotificationAction) confirmDelivery(ctx context.Context, recipientType, profileID string, subscriptionIDs, clientIDs []string) error {
 	body := confirmDeliveryRequest{
 		RecipientType:   recipientType,
+		ProfileID:       profileID,
 		SubscriptionIDs: subscriptionIDs,
+		ClientIDs:       clientIDs,
 	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
