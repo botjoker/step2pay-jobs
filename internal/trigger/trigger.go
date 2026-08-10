@@ -17,9 +17,13 @@ var Registry = map[string]Trigger{
 	"cron":      &CronTrigger{},
 	"condition": &ConditionTrigger{},
 	"event":     &EventTrigger{},
+	"once":      &OnceTrigger{},
 }
 
 func NextRunForJob(job models.SchedulerJob, pollInterval time.Duration) (*time.Time, error) {
+	if job.TriggerType == "once" {
+		return nil, nil
+	}
 	if job.TriggerType == "cron" {
 		return NextCronRun(json.RawMessage(job.TriggerConfig))
 	}

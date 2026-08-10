@@ -19,12 +19,22 @@ func NewJobRepo(pool *pgxpool.Pool) *JobRepo {
 
 func (r *JobRepo) LoadDueJobs(ctx context.Context) ([]models.SchedulerJob, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, profile_id, name, is_active, trigger_type, trigger_config,
-		       action_type, action_config, last_run, next_run, status
-		FROM scheduler_jobs
-		WHERE is_active = true
-		  AND (next_run IS NULL OR next_run <= now())
-		ORDER BY next_run ASC NULLS FIRST
+		WITH due AS (
+			SELECT id
+			FROM scheduler_jobs
+			WHERE is_active = true
+			  AND (next_run IS NULL OR next_run <= now())
+			  AND (status <> 'running' OR updated_at < now() - interval '30 minutes')
+			ORDER BY next_run ASC NULLS FIRST
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE scheduler_jobs AS jobs
+		SET status = 'running', updated_at = now()
+		FROM due
+		WHERE jobs.id = due.id
+		RETURNING jobs.id, jobs.profile_id, jobs.name, jobs.is_active,
+		          jobs.trigger_type, jobs.trigger_config, jobs.action_type,
+		          jobs.action_config, jobs.last_run, jobs.next_run, jobs.status
 	`)
 	if err != nil {
 		return nil, err
@@ -47,18 +57,22 @@ func (r *JobRepo) LoadDueJobs(ctx context.Context) ([]models.SchedulerJob, error
 	return jobs, rows.Err()
 }
 
-func (r *JobRepo) UpdateAfterRun(ctx context.Context, jobID uuid.UUID, nextRun *time.Time, status, errMsg string) error {
+func (r *JobRepo) UpdateAfterRun(ctx context.Context, jobID uuid.UUID, nextRun *time.Time, status, errMsg string, deactivate bool) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE scheduler_jobs
-		SET last_run = now(), next_run = $1, status = $2, error_msg = $3, updated_at = now()
-		WHERE id = $4
-	`, nextRun, status, errMsg, jobID)
+		SET last_run = now(), next_run = $1, status = $2, error_msg = $3,
+		    is_active = CASE WHEN $4 THEN false ELSE is_active END,
+		    updated_at = now()
+		WHERE id = $5
+	`, nextRun, status, errMsg, deactivate, jobID)
 	return err
 }
 
 func (r *JobRepo) UpdateNextRun(ctx context.Context, jobID uuid.UUID, nextRun *time.Time) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE scheduler_jobs SET next_run = $1, updated_at = now() WHERE id = $2
+		UPDATE scheduler_jobs
+		SET next_run = $1, status = 'idle', updated_at = now()
+		WHERE id = $2
 	`, nextRun, jobID)
 	return err
 }

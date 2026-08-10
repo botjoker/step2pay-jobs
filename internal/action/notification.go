@@ -232,7 +232,12 @@ func (a *NotificationAction) Execute(ctx context.Context, job models.SchedulerJo
 	}
 
 	// Двухфазный коммит: подтверждаем доставку (legacy subscription-поля + унифицированный дедуп).
-	if len(sentSubscriptionIDs) > 0 || len(sentClientIDs) > 0 {
+	needsConfirmation := cfg.RecipientType == "low_subscription" ||
+		cfg.RecipientType == "expiring_soon" ||
+		cfg.RecipientType == "debtors" ||
+		cfg.RecipientType == "auto_renew_upcoming" ||
+		cfg.RecipientType == "auto_renew_failed"
+	if needsConfirmation && (len(sentSubscriptionIDs) > 0 || len(sentClientIDs) > 0) {
 		if err := a.confirmDelivery(ctx, cfg.RecipientType, job.ProfileID.String(), sentSubscriptionIDs, sentClientIDs); err != nil {
 			// Не фатально: lease сам истечёт через 15 мин, просто лог
 			errs = append(errs, fmt.Sprintf("confirm delivery: %v", err))
@@ -381,14 +386,20 @@ var unresolvedPlaceholder = regexp.MustCompile(`\{\{[^}]+\}\}`)
 
 func renderMessage(tmpl string, r recipientInfo) string {
 	fullName := strings.TrimSpace(r.Firstname + " " + r.Lastname)
-	s := strings.ReplaceAll(tmpl, "{{name}}", fullName)
-	s = strings.ReplaceAll(s, "{{firstname}}", r.Firstname)
-	s = strings.ReplaceAll(s, "{{lastname}}", r.Lastname)
+	s := replaceTemplateValue(tmpl, "name", fullName)
+	s = replaceTemplateValue(s, "client_name", fullName)
+	s = replaceTemplateValue(s, "firstname", r.Firstname)
+	s = replaceTemplateValue(s, "lastname", r.Lastname)
 	for k, v := range r.TemplateVars {
-		s = strings.ReplaceAll(s, "{{"+k+"}}", v)
+		s = replaceTemplateValue(s, k, v)
 	}
 	s = unresolvedPlaceholder.ReplaceAllString(s, "")
 	return s
+}
+
+func replaceTemplateValue(source, key, value string) string {
+	source = strings.ReplaceAll(source, "{{"+key+"}}", value)
+	return strings.ReplaceAll(source, "{"+key+"}", value)
 }
 
 func sendTelegramMsg(bot *tgbotapi.BotAPI, chatID, message string) error {

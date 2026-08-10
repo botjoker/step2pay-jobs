@@ -121,7 +121,7 @@ func (s *Scheduler) finish(ctx context.Context, job models.SchedulerJob, status,
 	if status == "error" {
 		errMsg = message
 	}
-	if err := s.repo.UpdateAfterRun(ctx, job.ID, nextRun, status, errMsg); err != nil {
+	if err := s.repo.UpdateAfterRun(ctx, job.ID, nextRun, status, errMsg, job.TriggerType == "once"); err != nil {
 		log.Printf("[scheduler] warn: UpdateAfterRun: %v", err)
 	}
 	if err := s.repo.WriteLog(ctx, job.ID, status, message, count); err != nil {
